@@ -1,6 +1,7 @@
 # -*- coding: utf8 -*-
 import math
 import traceback
+import urllib
 from datetime import datetime
 import pytz
 
@@ -11,6 +12,7 @@ import time
 import os
 
 import requests
+from Crypto.Cipher import AES
 
 
 # 获取北京时间
@@ -18,6 +20,17 @@ def get_beijing_time():
     target_timezone = pytz.timezone('Asia/Shanghai')
     # 获取当前时间
     return datetime.now().astimezone(target_timezone)
+
+
+# 参考自 https://github.com/hanximeng/Zepp_API/blob/main/index.php
+def encrypt_data(plain: bytes) -> bytes:
+    key = b'xeNtBVqzDc6tuNTh'  # 16 bytes
+    iv = b'MAAAYAAAAAAAAABg'  # 16 bytes
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    # AES-128-CBC 使用 PKCS#7 填充。
+    pad_len = AES.block_size - (len(plain) % AES.block_size)
+    padded = plain + bytes([pad_len]) * pad_len
+    return cipher.encrypt(padded)
 
 
 # 格式化时间
@@ -37,8 +50,7 @@ def get_min_max_by_time(hour=None, minute=None):
         hour = time_bj.hour
     if minute is None:
         minute = time_bj.minute
-    time_rate = 1 
-    # min((hour * 60 + minute) / (22 * 60), 1)
+    time_rate = min((hour * 60 + minute) / (22 * 60), 1)
     min_step = get_int_value_default(config, 'MIN_STEP', 18000)
     max_step = get_int_value_default(config, 'MAX_STEP', 25000)
     return int(time_rate * min_step), int(time_rate * max_step)
@@ -120,22 +132,34 @@ class MiMotionRunner:
     # 登录
     def login(self):
 
-        url1 = "https://api-user.huami.com/registrations/" + self.user + "/tokens"
-        login_headers = {
-            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 14_7_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.2",
+        headers = {
+            "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "user-agent": "MiFit6.14.0 (M2007J1SC; Android 12; Density/2.75)",
+            "app_name": "com.xiaomi.hm.health",
+            "appname": "com.xiaomi.hm.health",
+            "appplatform": "android_phone",
+            "x-hm-ekv": "1",
+            "hm-privacy-ceip": "false",
             "X-Forwarded-For": self.fake_ip_addr
         }
-        data1 = {
-            "client_id": "HuaMi",
-            "password": f"{self.password}",
-            "redirect_uri": "https://s3-us-west-2.amazonaws.com/hm-registration/successsignin.html",
-            "token": "access"
+
+        login_data = {
+            'emailOrPhone': self.user,
+            'password': self.password,
+            'state': 'REDIRECTION',
+            'client_id': 'HuaMi',
+            'country_code': 'CN',
+            'token': 'access',
+            'redirect_uri': 'https://s3-us-west-2.amazonaws.com/hm-registration/successsignin.html',
         }
-        r1 = requests.post(url1, data=data1, headers=login_headers, allow_redirects=False)
-        if r1.status_code != 303:
-            self.log_str += "登录异常，status: %d\n" % r1.status_code
-            return 0, 0
+        # 等同 http_build_query，默认使用 quote_plus 将空格转为 '+'
+        query = urllib.parse.urlencode(login_data)
+        plaintext = query.encode('utf-8')
+        # 执行请求加密
+        cipher_data = encrypt_data(plaintext)
+
+        url1 = 'https://api-user.zepp.com/v2/registrations/tokens'
+        r1 = requests.post(url1, data=cipher_data, headers=headers, allow_redirects=False)
         location = r1.headers["Location"]
         try:
             code = get_access_token(location)
@@ -176,7 +200,7 @@ class MiMotionRunner:
                 "source": "com.xiaomi.hm.health",
                 "third_name": "email",
             }
-        r2 = requests.post(url2, data=data2, headers=login_headers).json()
+        r2 = requests.post(url2, data=data2, headers=headers).json()
         login_token = r2["token_info"]["login_token"]
         # print("login_token获取成功！")
         # print(login_token)
@@ -259,7 +283,7 @@ def push_to_push_plus(exec_results, summary):
 def run_single_account(total, idx, user_mi, passwd_mi):
     idx_info = ""
     if idx is not None:
-        idx_info = f"[{idx+1}/{total}]"
+        idx_info = f"[{idx + 1}/{total}]"
     log_str = f"[{format_now()}]\n{idx_info}账号：{desensitize_user_name(user_mi)}"
     try:
         runner = MiMotionRunner(user_mi, passwd_mi)
@@ -286,7 +310,8 @@ def execute():
         if use_concurrent:
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor() as executor:
-                exec_results = executor.map(lambda x: run_single_account(total, x[0], *x[1]), enumerate(zip(user_list, passwd_list)))
+                exec_results = executor.map(lambda x: run_single_account(total, x[0], *x[1]),
+                                            enumerate(zip(user_list, passwd_list)))
         else:
             for user_mi, passwd_mi in zip(user_list, passwd_list):
                 exec_results.append(run_single_account(total, idx, user_mi, passwd_mi))
@@ -296,12 +321,14 @@ def execute():
                     time.sleep(sleep_seconds)
 
         success_count = 0
+        push_results = []
         for result in exec_results:
+            push_results.append(result)
             if result['success'] is True:
                 success_count += 1
         summary = f"\n执行账号总数{total}，成功：{success_count}，失败：{total - success_count}"
         print(summary)
-        push_to_push_plus(exec_results, summary)
+        push_to_push_plus(push_results, summary)
     else:
         print(f"账号数长度[{len(user_list)}]和密码数长度[{len(passwd_list)}]不匹配，跳过执行")
         exit(1)
